@@ -1,45 +1,61 @@
-use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Error, ErrorKind, Result, Write};
 use std::path::Path;
 
+use clap::Parser;
 use itertools::Itertools;
 use serde_json::{Map, Value};
 
+use crate::cli::CLI;
+
+mod cli;
+
 const INDENT: usize = 4;
-const USAGE: &str = "usage: pretty-json <source> [output]";
 
 fn main() -> Result<()> {
-    let source = env::args().nth(1).ok_or_else(|| Error::new(ErrorKind::Other, USAGE))?;
-    let source_json = read_json(&source)?;
-    let pretty_output = pretty_name(&source)?;
+    let cli = CLI::parse();
+    let source_json = read_json(&cli.source)?;
+    let pretty_output = pretty_name(&cli);
     let output = File::create(pretty_output)?;
     let mut output = BufWriter::new(output);
+    let mut property = String::default();
 
-    write_pretty(&mut output, &source_json, 0)
+    write_pretty(&mut output, &source_json, 0, &mut property, &cli.flat.unwrap_or_default())
 }
 
-fn write_pretty<W: Write>(output: &mut W, value: &Value, level: usize) -> Result<()> {
+fn write_pretty<W: Write>(
+    output: &mut W,
+    value: &Value,
+    level: usize,
+    property: &mut String,
+    flat: &[String],
+) -> Result<()> {
     match value {
         Value::Null => write!(output, "null"),
         Value::Bool(value) => write!(output, "{value}"),
         Value::Number(value) => write!(output, "{value}"),
         Value::String(value) => write!(output, "{value:?}"),
-        Value::Array(array) => write_pretty_array(output, &array, level),
-        Value::Object(object) => write_pretty_object(output, &object, level)
+        Value::Array(array) => write_pretty_array(output, array, level, property, flat),
+        Value::Object(object) => write_pretty_object(output, object, level, property, flat)
     }
 }
 
-fn write_pretty_array<W: Write>(output: &mut W, array: &Vec<Value>, level: usize) -> Result<()> {
+fn write_pretty_array<W: Write>(
+    output: &mut W,
+    array: &Vec<Value>,
+    level: usize,
+    property: &mut String,
+    flat: &[String],
+) -> Result<()> {
     let padding = level * INDENT;
     let field_padding = (level + 1) * INDENT;
+    let mut idx = 0;
 
     let chunked = array.len() > 10 || array.iter().any(
         |itm| matches!(itm, Value::Array(_) | Value::Object(_))
     );
 
     if chunked {
-        let mut idx = 0;
         let max = array.len().max(1) - 1;
 
         let has_objects = array.iter().any(|itm|
@@ -61,7 +77,7 @@ fn write_pretty_array<W: Write>(output: &mut W, array: &Vec<Value>, level: usize
             write!(output, "{:field_padding$}", ' ')?;
 
             for value in values {
-                write_pretty(output, &value, level + 1)?;
+                write_pretty(output, value, level + 1, property, flat)?;
 
                 if idx < max {
                     write!(output, ", ")?;
@@ -75,12 +91,10 @@ fn write_pretty_array<W: Write>(output: &mut W, array: &Vec<Value>, level: usize
 
         write!(output, "{:padding$}]", ' ')
     } else {
-        let mut idx = 0;
-
         write!(output, "[")?;
 
         for value in array.iter() {
-            write_pretty(output, &value, level + 1)?;
+            write_pretty(output, value, level + 1, property, flat)?;
 
             if idx < array.len() - 1 {
                 write!(output, ", ")?;
@@ -97,57 +111,80 @@ fn write_pretty_object<W: Write>(
     output: &mut W,
     object: &Map<String, Value>,
     level: usize,
+    property: &mut String,
+    flat: &[String],
 ) -> Result<()> {
     let padding = level * INDENT;
     let field_padding = (level + 1) * INDENT;
     let last = object.len() - 1;
+    let flatten = flat.contains(property);
 
-    writeln!(output, "{{")?;
+    if flatten {
+        write!(output, "{{ ")?;
+    } else {
+        writeln!(output, "{{")?;
+    }
 
     for (idx, (field, value)) in object.iter().enumerate() {
-        write!(output, "{:field_padding$}\"{field}\": ", ' ')?;
+        if flatten {
+            write!(output, "\"{field}\": ")?;
+        } else {
+            write!(output, "{:field_padding$}\"{field}\": ", ' ')?;
+        }
 
-        write_pretty(output, value, level + 1)?;
+        let mut property = property.clone();
+
+        if !property.is_empty() {
+            property.push('.');
+        }
+
+        property.push_str(field);
+
+        write_pretty(output, value, level + 1, &mut property, flat)?;
 
         if idx < last {
             write!(output, ", ")?;
         }
 
-        writeln!(output)?;
+        if !flatten {
+            writeln!(output)?;
+        }
     }
 
-    write!(output, "{:padding$}}}", ' ')
+    if flatten {
+        write!(output, " }}")
+    } else {
+        write!(output, "{:padding$}}}", ' ')
+    }
 }
 
-fn pretty_name(source: &String) -> Result<String> {
-    env::args().nth(2)
-        .or_else(|| {
-            let pretty = Path::new(&source);
-            let extension = pretty.extension().unwrap_or_default().to_str().unwrap_or_default();
-            let mut filename = pretty.file_name().unwrap().to_string_lossy().to_string();
+fn pretty_name(cli: &CLI) -> String {
+    cli.output.clone().unwrap_or_else(|| {
+        let pretty = Path::new(&cli.source);
+        let extension = pretty.extension().unwrap_or_default().to_str().unwrap_or_default();
+        let mut filename = pretty.file_name().unwrap().to_string_lossy().to_string();
 
-            filename = filename.replace(extension, "");
+        filename = filename.replace(extension, "");
 
-            if filename.ends_with('.') {
-                filename.pop();
-            }
+        if filename.ends_with('.') {
+            filename.pop();
+        }
 
-            filename.push_str("-pretty");
+        filename.push_str("-pretty");
 
-            if extension.len() > 0 {
-                filename.push('.');
-                filename.push_str(extension);
-            }
+        if !extension.is_empty() {
+            filename.push('.');
+            filename.push_str(extension);
+        }
 
-            let pretty = pretty.with_file_name(filename);
+        let pretty = pretty.with_file_name(filename);
 
-            Some(pretty.to_string_lossy().to_string())
-        })
-        .ok_or_else(|| Error::new(ErrorKind::Other, USAGE))
+        pretty.to_string_lossy().to_string()
+    })
 }
 
-fn read_json(source: &String) -> Result<Value> {
-    let file = File::open(&source)?;
+fn read_json(source: &str) -> Result<Value> {
+    let file = File::open(source)?;
     let reader = BufReader::new(file);
 
     serde_json::from_reader(reader)
